@@ -1,92 +1,178 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, Field
-from pathlib import Path
-from typing import Dict, Optional, Any
-from datetime import datetime
-import json
+import os
 import re
-import shutil
-import tempfile
-import zipfile
+import json
 import uuid
+import shutil
+import zipfile
+from pathlib import Path
+from typing import Optional
 
-# ============================================================
-# MSWEB BACKEND
-# ============================================================
+import httpx
+
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    UploadFile,
+    File,
+)
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
+
+
+# =========================================================
+# MSWEB CONFIG
+# =========================================================
 
 APP_NAME = "MSWEB"
-VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 PROJECTS_DIR = DATA_DIR / "projects"
+UPLOADS_DIR = DATA_DIR / "uploads"
 EXPORTS_DIR = DATA_DIR / "exports"
 
 PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# =========================================================
+# BUILD WORKER CONFIG
+# =========================================================
+
+BUILD_WORKER_URL = os.getenv(
+    "BUILD_WORKER_URL",
+    ""
+).rstrip("/")
+
+MSWEB_WORKER_SECRET = os.getenv(
+    "MSWEB_WORKER_SECRET",
+    "")
+
+
+# =========================================================
+# FASTAPI
+# =========================================================
 
 app = FastAPI(
     title="MSWEB API",
-    description="Backend API for MSWEB Ultimate Web App Builder",
-    version=VERSION
+    version=APP_VERSION,
+    description="MSWEB App Builder Backend"
 )
 
-# ============================================================
+
+# =========================================================
 # CORS
-# ============================================================
+# =========================================================
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Production-এ নিজের frontend domain দিন
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ============================================================
+
+# =========================================================
 # MODELS
-# ============================================================
-
-class Page(BaseModel):
-    name: str = "Home"
-    html: str = ""
-    css: str = ""
-    js: str = ""
-
+# =========================================================
 
 class ProjectCreate(BaseModel):
-    name: str = Field(default="Untitled Project", min_length=1, max_length=100)
-    pages: Dict[str, Page] = {}
+    name: str = Field(
+        default="My MSWEB App",
+        min_length=1,
+        max_length=100
+    )
 
 
 class ProjectUpdate(BaseModel):
-    name: Optional[str] = Field(default=None, max_length=100)
-    pages: Optional[Dict[str, Page]] = None
-    current: Optional[str] = None
+    name: Optional[str] = Field(
+        default=None,
+        max_length=100
+    )
+
+    html: Optional[str] = Field(
+        default=None,
+        max_length=5_000_000
+    )
+
+    css: Optional[str] = Field(
+        default=None,
+        max_length=5_000_000
+    )
+
+    js: Optional[str] = Field(
+        default=None,
+        max_length=5_000_000
+    )
 
 
-class Project(BaseModel):
-    id: str
-    name: str
-    pages: Dict[str, Page]
-    current: str
-    created_at: str
-    updated_at: str
+class PageCreate(BaseModel):
+    name: str = Field(
+        default="New Page",
+        min_length=1,
+        max_length=100
+    )
 
 
-# ============================================================
+class APKBuildRequest(BaseModel):
+    app_name: str = Field(
+        default="MSWEB App",
+        min_length=1,
+        max_length=50
+    )
+
+    package_name: str = Field(
+        default="com.msweb.app",
+        min_length=3,
+        max_length=100
+    )
+
+    version_name: str = Field(
+        default="1.0.0",
+        min_length=1,
+        max_length=30
+    )
+
+    version_code: int = Field(
+        default=1,
+        ge=1,
+        le=2147483647
+    )
+
+    html: str = Field(
+        default="",
+        max_length=5_000_000
+    )
+
+    css: str = Field(
+        default="",
+        max_length=5_000_000
+    )
+
+    js: str = Field(
+        default="",
+        max_length=5_000_000
+    )
+
+
+# =========================================================
 # HELPERS
-# ============================================================
-
-def safe_name(value: str) -> str:
-    value = re.sub(r"[^a-zA-Z0-9_\- ]+", "", value)
-    value = value.strip().replace(" ", "-")
-    return value[:80] or "project"
-
+# =========================================================
 
 def project_file(project_id: str) -> Path:
+    if not re.fullmatch(
+        r"^[a-f0-9]{32}$",
+        project_id
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid project ID."
+        )
+
     return PROJECTS_DIR / f"{project_id}.json"
 
 
@@ -96,113 +182,180 @@ def load_project(project_id: str) -> dict:
     if not path.exists():
         raise HTTPException(
             status_code=404,
-            detail="Project not found"
+            detail="Project not found."
         )
 
     try:
         return json.loads(
-            path.read_text(encoding="utf-8")
+            path.read_text(
+                encoding="utf-8"
+            )
         )
     except Exception:
         raise HTTPException(
             status_code=500,
-            detail="Project data is corrupted"
+            detail="Project data is corrupted."
         )
 
 
-def save_project(data: dict) -> None:
-    path = project_file(data["id"])
+def save_project(project: dict):
+    path = project_file(
+        project["id"]
+    )
 
-    temp_path = path.with_suffix(".tmp")
-
-    temp_path.write_text(
+    path.write_text(
         json.dumps(
-            data,
+            project,
             indent=2,
             ensure_ascii=False
         ),
         encoding="utf-8"
     )
 
-    temp_path.replace(path)
+
+def clean_filename(filename: str) -> str:
+    filename = Path(
+        filename or "file"
+    ).name
+
+    filename = re.sub(
+        r"[^a-zA-Z0-9._-]",
+        "_",
+        filename
+    )
+
+    return filename[:150]
 
 
-def create_default_page() -> Dict[str, Page]:
+def create_default_project(
+    project_id: str,
+    name: str
+) -> dict:
+
     return {
-        "home": Page(
-            name="Home",
-            html="",
-            css="",
-            js=""
-        )
+        "id": project_id,
+        "name": name.strip() or "My MSWEB App",
+        "version": 1,
+        "created_at": __import__("datetime")
+            .datetime.utcnow()
+            .isoformat(),
+        "updated_at": __import__("datetime")
+            .datetime.utcnow()
+            .isoformat(),
+
+        "html": """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+    <title>MSWEB App</title>
+</head>
+
+<body>
+
+    <main>
+        <h1>Welcome to MSWEB</h1>
+        <p>Start building your app.</p>
+    </main>
+
+</body>
+</html>
+""",
+
+        "css": """* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    min-height: 100vh;
+    font-family: Arial, sans-serif;
+    background: #0f172a;
+    color: white;
+}
+
+main {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    padding: 24px;
+}
+""",
+
+        "js": """document.addEventListener(
+    "DOMContentLoaded",
+    () => {
+        console.log("MSWEB app loaded");
+    }
+);
+""",
+
+        "pages": [
+            {
+                "id": "home",
+                "name": "Home",
+                "path": "index.html"
+            }
+        ]
     }
 
 
-def validate_page_id(page_id: str):
-    if not re.fullmatch(r"[a-zA-Z0-9_\-]{1,80}", page_id):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid page ID"
-        )
-
-
-# ============================================================
-# ROOT
-# ============================================================
+# =========================================================
+# ROOT / HEALTH
+# =========================================================
 
 @app.get("/")
-def root():
+async def root():
     return {
         "name": APP_NAME,
-        "version": VERSION,
+        "version": APP_VERSION,
         "status": "online",
         "message": "MSWEB backend is running"
     }
 
 
-# ============================================================
-# HEALTH
-# ============================================================
+@app.get("/health")
+async def health():
+    return {
+        "status": "healthy",
+        "service": "msweb-main-api",
+        "build_worker_configured": bool(
+            BUILD_WORKER_URL
+        )
+    }
+
 
 @app.get("/api/health")
-def health():
+async def api_health():
     return {
-        "status": "ok",
-        "service": APP_NAME,
-        "version": VERSION,
-        "time": datetime.utcnow().isoformat() + "Z"
+        "status": "online",
+        "version": APP_VERSION,
+        "build_worker": bool(
+            BUILD_WORKER_URL
+        )
     }
 
 
-# ============================================================
+# =========================================================
 # PROJECT CREATE
-# ============================================================
+# =========================================================
 
 @app.post("/api/projects")
-def create_project(payload: ProjectCreate):
+async def create_project(
+    request: ProjectCreate
+):
 
-    project_id = str(uuid.uuid4())
+    project_id = uuid.uuid4().hex
 
-    pages = payload.pages
-
-    if not pages:
-        pages = create_default_page()
-
-    current = next(iter(pages))
-
-    now = datetime.utcnow().isoformat() + "Z"
-
-    project = {
-        "id": project_id,
-        "name": payload.name.strip(),
-        "pages": {
-            key: page.model_dump()
-            for key, page in pages.items()
-        },
-        "current": current,
-        "created_at": now,
-        "updated_at": now
-    }
+    project = create_default_project(
+        project_id,
+        request.name
+    )
 
     save_project(project)
 
@@ -212,55 +365,68 @@ def create_project(payload: ProjectCreate):
     }
 
 
-# ============================================================
-# LIST PROJECTS
-# ============================================================
+# =========================================================
+# PROJECT LIST
+# =========================================================
 
 @app.get("/api/projects")
-def list_projects():
+async def list_projects():
 
     projects = []
 
-    for path in PROJECTS_DIR.glob("*.json"):
+    for file in PROJECTS_DIR.glob("*.json"):
 
         try:
-            data = json.loads(
-                path.read_text(
+            project = json.loads(
+                file.read_text(
                     encoding="utf-8"
                 )
             )
 
             projects.append({
-                "id": data.get("id"),
-                "name": data.get("name"),
-                "current": data.get("current"),
-                "created_at": data.get("created_at"),
-                "updated_at": data.get("updated_at")
+                "id": project.get("id"),
+                "name": project.get("name"),
+                "version": project.get(
+                    "version",
+                    1
+                ),
+                "created_at": project.get(
+                    "created_at"
+                ),
+                "updated_at": project.get(
+                    "updated_at"
+                )
             })
 
         except Exception:
             continue
 
     projects.sort(
-        key=lambda x: x.get("updated_at") or "",
+        key=lambda x: x.get(
+            "updated_at",
+            ""
+        ),
         reverse=True
     )
 
     return {
         "success": True,
-        "count": len(projects),
         "projects": projects
     }
 
 
-# ============================================================
+# =========================================================
 # GET PROJECT
-# ============================================================
+# =========================================================
 
 @app.get("/api/projects/{project_id}")
-def get_project(project_id: str):
+async def get_project(
+    project_id: str
+):
 
-    project = load_project(project_id)
+    project = load_project(
+        project_id
+    )
 
     return {
         "success": True,
@@ -268,49 +434,43 @@ def get_project(project_id: str):
     }
 
 
-# ============================================================
+# =========================================================
 # UPDATE PROJECT
-# ============================================================
+# =========================================================
 
 @app.put("/api/projects/{project_id}")
-def update_project(
+async def update_project(
     project_id: str,
-    payload: ProjectUpdate
+    request: ProjectUpdate
 ):
 
-    project = load_project(project_id)
+    project = load_project(
+        project_id
+    )
 
-    if payload.name is not None:
+    if request.name is not None:
+        project["name"] = (
+            request.name.strip()
+            or project["name"]
+        )
 
-        name = payload.name.strip()
+    if request.html is not None:
+        project["html"] = request.html
 
-        if not name:
-            raise HTTPException(
-                status_code=400,
-                detail="Project name cannot be empty"
-            )
+    if request.css is not None:
+        project["css"] = request.css
 
-        project["name"] = name
+    if request.js is not None:
+        project["js"] = request.js
 
-    if payload.pages is not None:
-
-        project["pages"] = {
-            key: page.model_dump()
-            for key, page in payload.pages.items()
-        }
-
-    if payload.current is not None:
-
-        if payload.current not in project["pages"]:
-            raise HTTPException(
-                status_code=400,
-                detail="Current page does not exist"
-            )
-
-        project["current"] = payload.current
+    project["version"] = (
+        project.get("version", 1) + 1
+    )
 
     project["updated_at"] = (
-        datetime.utcnow().isoformat() + "Z"
+        __import__("datetime")
+        .datetime.utcnow()
+        .isoformat()
     )
 
     save_project(project)
@@ -321,521 +481,548 @@ def update_project(
     }
 
 
-# ============================================================
+# =========================================================
 # DELETE PROJECT
-# ============================================================
+# =========================================================
 
 @app.delete("/api/projects/{project_id}")
-def delete_project(project_id: str):
+async def delete_project(
+    project_id: str
+):
 
-    path = project_file(project_id)
+    path = project_file(
+        project_id
+    )
 
     if not path.exists():
         raise HTTPException(
             status_code=404,
-            detail="Project not found"
+            detail="Project not found."
         )
 
     path.unlink()
 
     return {
         "success": True,
-        "message": "Project deleted"
+        "message": "Project deleted."
     }
 
 
-# ============================================================
-# ADD PAGE
-# ============================================================
+# =========================================================
+# CREATE PAGE
+# =========================================================
 
-@app.post("/api/projects/{project_id}/pages/{page_id}")
-def add_page(
+@app.post(
+    "/api/projects/{project_id}/pages"
+)
+async def create_page(
     project_id: str,
-    page_id: str,
-    page: Page
+    request: PageCreate
 ):
 
-    validate_page_id(page_id)
+    project = load_project(
+        project_id
+    )
 
-    project = load_project(project_id)
+    page_id = uuid.uuid4().hex[:12]
 
-    if page_id in project["pages"]:
-        raise HTTPException(
-            status_code=409,
-            detail="Page already exists"
-        )
+    page = {
+        "id": page_id,
+        "name": request.name.strip()
+            or "New Page",
+        "path": f"{page_id}.html"
+    }
 
-    project["pages"][page_id] = page.model_dump()
+    if "pages" not in project:
+        project["pages"] = []
+
+    project["pages"].append(page)
 
     project["updated_at"] = (
-        datetime.utcnow().isoformat() + "Z"
+        __import__("datetime")
+        .datetime.utcnow()
+        .isoformat()
     )
 
     save_project(project)
 
     return {
         "success": True,
-        "page_id": page_id,
-        "page": page.model_dump()
+        "page": page,
+        "project": project
     }
 
 
-# ============================================================
-# GET PAGE
-# ============================================================
+# =========================================================
+# IMPORT HTML / CSS / JS
+# =========================================================
 
-@app.get("/api/projects/{project_id}/pages/{page_id}")
-def get_page(
-    project_id: str,
-    page_id: str
+@app.post("/api/import")
+async def import_files(
+    files: list[UploadFile] = File(...)
 ):
 
-    project = load_project(project_id)
-
-    if page_id not in project["pages"]:
-        raise HTTPException(
-            status_code=404,
-            detail="Page not found"
-        )
-
-    return {
-        "success": True,
-        "page_id": page_id,
-        "page": project["pages"][page_id]
+    imported = {
+        "html": "",
+        "css": "",
+        "js": "",
+        "files": []
     }
 
-
-# ============================================================
-# UPDATE PAGE
-# ============================================================
-
-@app.put("/api/projects/{project_id}/pages/{page_id}")
-def update_page(
-    project_id: str,
-    page_id: str,
-    page: Page
-):
-
-    project = load_project(project_id)
-
-    if page_id not in project["pages"]:
-        raise HTTPException(
-            status_code=404,
-            detail="Page not found"
-        )
-
-    project["pages"][page_id] = page.model_dump()
-
-    project["updated_at"] = (
-        datetime.utcnow().isoformat() + "Z"
-    )
-
-    save_project(project)
-
-    return {
-        "success": True,
-        "page_id": page_id,
-        "page": page.model_dump()
+    allowed = {
+        ".html": "html",
+        ".htm": "html",
+        ".css": "css",
+        ".js": "js"
     }
 
+    for upload in files:
 
-# ============================================================
-# DELETE PAGE
-# ============================================================
-
-@app.delete("/api/projects/{project_id}/pages/{page_id}")
-def delete_page(
-    project_id: str,
-    page_id: str
-):
-
-    project = load_project(project_id)
-
-    if page_id not in project["pages"]:
-        raise HTTPException(
-            status_code=404,
-            detail="Page not found"
+        filename = clean_filename(
+            upload.filename
         )
 
-    if len(project["pages"]) <= 1:
+        extension = Path(
+            filename
+        ).suffix.lower()
+
+        if extension not in allowed:
+            continue
+
+        data = await upload.read()
+
+        if len(data) > 5_000_000:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"{filename} is too large."
+                )
+            )
+
+        try:
+            content = data.decode(
+                "utf-8"
+            )
+        except UnicodeDecodeError:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{filename} must be UTF-8 text."
+                )
+            )
+
+        key = allowed[extension]
+
+        imported[key] += (
+            "\n" + content
+        )
+
+        imported["files"].append(
+            filename
+        )
+
+    if not imported["files"]:
         raise HTTPException(
             status_code=400,
-            detail="A project must have at least one page"
+            detail=(
+                "No valid HTML, CSS or JS "
+                "files were uploaded."
+            )
         )
-
-    del project["pages"][page_id]
-
-    if project["current"] == page_id:
-        project["current"] = next(
-            iter(project["pages"])
-        )
-
-    project["updated_at"] = (
-        datetime.utcnow().isoformat() + "Z"
-    )
-
-    save_project(project)
 
     return {
         "success": True,
-        "message": "Page deleted",
-        "current": project["current"]
+        "imported": imported
     }
 
 
-# ============================================================
-# BUILD SINGLE PAGE
-# ============================================================
+# =========================================================
+# IMPORT ZIP
+# =========================================================
 
-def build_page(
-    project: dict,
-    page_id: str,
-    output_dir: Path
+@app.post("/api/import/zip")
+async def import_zip(
+    file: UploadFile = File(...)
 ):
 
-    page = project["pages"][page_id]
-
-    html = page.get("html", "")
-    css = page.get("css", "")
-    js = page.get("js", "")
-
-    final_html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport"
-      content="width=device-width,initial-scale=1.0">
-
-<title>{project["name"]}</title>
-
-<style>
-{css}
-</style>
-
-</head>
-
-<body>
-
-{html}
-
-<script>
-"use strict";
-
-try {{
-{js}
-}} catch(error) {{
-    console.error(error);
-}}
-
-</script>
-
-</body>
-</html>
-"""
-
-    filename = (
-        "index.html"
-        if page_id == "home"
-        else f"{safe_name(page.get('name', page_id))}.html"
+    filename = clean_filename(
+        file.filename
     )
 
-    target = output_dir / filename
+    if not filename.lower().endswith(
+        ".zip"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Only ZIP files are allowed."
+        )
 
-    target.write_text(
-        final_html,
-        encoding="utf-8"
+    data = await file.read()
+
+    if len(data) > 25_000_000:
+        raise HTTPException(
+            status_code=413,
+            detail="ZIP file is too large."
+        )
+
+    temp_zip = (
+        UPLOADS_DIR
+        / f"{uuid.uuid4().hex}.zip"
     )
 
-    return filename
+    temp_zip.write_bytes(data)
 
+    extracted_dir = (
+        UPLOADS_DIR
+        / uuid.uuid4().hex
+    )
 
-# ============================================================
-# BUILD PROJECT
-# ============================================================
-
-@app.post("/api/projects/{project_id}/build")
-def build_project(project_id: str):
-
-    project = load_project(project_id)
-
-    build_id = str(uuid.uuid4())
-
-    build_dir = EXPORTS_DIR / build_id
-
-    build_dir.mkdir(
+    extracted_dir.mkdir(
         parents=True,
         exist_ok=True
     )
 
     try:
 
-        files = []
+        with zipfile.ZipFile(
+            temp_zip,
+            "r"
+        ) as archive:
 
-        for page_id in project["pages"]:
+            for info in archive.infolist():
 
-            filename = build_page(
-                project,
-                page_id,
-                build_dir
+                member = Path(
+                    info.filename
+                )
+
+                if member.is_absolute():
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Unsafe ZIP file."
+                    )
+
+                if ".." in member.parts:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Unsafe ZIP file."
+                    )
+
+            archive.extractall(
+                extracted_dir
             )
 
-            files.append(filename)
-
-        manifest = {
-            "name": project["name"],
-            "project_id": project["id"],
-            "generated_at":
-                datetime.utcnow().isoformat()+"Z",
-            "files": files
+        found = {
+            "html": [],
+            "css": [],
+            "js": []
         }
 
-        (build_dir / "msweb.json").write_text(
+        for path in extracted_dir.rglob("*"):
+
+            if not path.is_file():
+                continue
+
+            ext = path.suffix.lower()
+
+            if ext in (
+                ".html",
+                ".htm"
+            ):
+                found["html"].append(
+                    str(path.relative_to(
+                        extracted_dir
+                    ))
+                )
+
+            elif ext == ".css":
+                found["css"].append(
+                    str(path.relative_to(
+                        extracted_dir
+                    ))
+                )
+
+            elif ext == ".js":
+                found["js"].append(
+                    str(path.relative_to(
+                        extracted_dir
+                    ))
+                )
+
+        return {
+            "success": True,
+            "files": found
+        }
+
+    finally:
+
+        temp_zip.unlink(
+            missing_ok=True
+        )
+
+        shutil.rmtree(
+            extracted_dir,
+            ignore_errors=True
+        )
+
+
+# =========================================================
+# EXPORT PROJECT
+# =========================================================
+
+@app.get(
+    "/api/projects/{project_id}/export"
+)
+async def export_project(
+    project_id: str
+):
+
+    project = load_project(
+        project_id
+    )
+
+    export_id = uuid.uuid4().hex
+
+    zip_path = (
+        EXPORTS_DIR
+        / f"{export_id}.zip"
+    )
+
+    with zipfile.ZipFile(
+        zip_path,
+        "w",
+        zipfile.ZIP_DEFLATED
+    ) as archive:
+
+        archive.writestr(
+            "index.html",
+            project.get(
+                "html",
+                ""
+            )
+        )
+
+        archive.writestr(
+            "style.css",
+            project.get(
+                "css",
+                ""
+            )
+        )
+
+        archive.writestr(
+            "app.js",
+            project.get(
+                "js",
+                ""
+            )
+        )
+
+        archive.writestr(
+            "msweb-project.json",
             json.dumps(
-                manifest,
+                project,
                 indent=2,
                 ensure_ascii=False
-            ),
-            encoding="utf-8"
+            )
+        )
+
+    return FileResponse(
+        path=str(zip_path),
+        media_type="application/zip",
+        filename=(
+            f"{project.get('name', 'MSWEB-App')}.zip"
+        )
+    )
+
+
+# =========================================================
+# BUILD APK
+# =========================================================
+
+@app.post("/api/build")
+async def build_apk(
+    request: APKBuildRequest
+):
+
+    if not BUILD_WORKER_URL:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "APK build worker is not configured."
+            )
+        )
+
+    if not MSWEB_WORKER_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Build worker secret is not configured."
+            )
+        )
+
+    payload = {
+        "app_name": request.app_name,
+        "package_name": request.package_name,
+        "version_name": request.version_name,
+        "version_code": request.version_code,
+        "html": request.html,
+        "css": request.css,
+        "js": request.js
+    }
+
+    headers = {
+        "X-MSWEB-Secret": MSWEB_WORKER_SECRET
+    }
+
+    timeout = httpx.Timeout(
+        connect=20.0,
+        read=920.0,
+        write=30.0,
+        pool=30.0
+    )
+
+    try:
+
+        async with httpx.AsyncClient(
+            timeout=timeout
+        ) as client:
+
+            response = await client.post(
+                f"{BUILD_WORKER_URL}/build",
+                json=payload,
+                headers=headers
+            )
+
+        if response.status_code != 200:
+
+            try:
+                worker_error = (
+                    response.json()
+                )
+            except Exception:
+                worker_error = response.text
+
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": (
+                        "Build worker returned "
+                        "an error."
+                    ),
+                    "worker": worker_error
+                }
+            )
+
+        result = response.json()
+
+        if not result.get("success"):
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "APK build failed."
+                )
+            )
+
+        build_id = result.get(
+            "build_id"
         )
 
         return {
             "success": True,
             "build_id": build_id,
-            "files": files
+            "status": result.get(
+                "status",
+                "completed"
+            ),
+            "worker_download": result.get(
+                "file"
+            ),
+            "message": (
+                "APK build completed."
+            )
         }
 
-    except Exception as error:
+    except HTTPException:
+        raise
 
-        shutil.rmtree(
-            build_dir,
-            ignore_errors=True
-        )
-
+    except httpx.TimeoutException:
         raise HTTPException(
-            status_code=500,
-            detail=f"Build failed: {error}"
+            status_code=504,
+            detail=(
+                "APK build timed out."
+            )
+        )
+
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Build worker unavailable: {exc}"
+            )
         )
 
 
-# ============================================================
-# ZIP EXPORT
-# ============================================================
+# =========================================================
+# BUILD WORKER HEALTH
+# =========================================================
 
-@app.post("/api/projects/{project_id}/export")
-def export_project(project_id: str):
+@app.get("/api/build/health")
+async def build_worker_health():
 
-    project = load_project(project_id)
-
-    export_id = str(uuid.uuid4())
-
-    temp_dir = EXPORTS_DIR / export_id
-
-    temp_dir.mkdir(
-        parents=True,
-        exist_ok=True
-    )
+    if not BUILD_WORKER_URL:
+        return {
+            "configured": False,
+            "status": "not_configured"
+        }
 
     try:
 
-        files=[]
+        async with httpx.AsyncClient(
+            timeout=15
+        ) as client:
 
-        for page_id in project["pages"]:
-
-            filename=build_page(
-                project,
-                page_id,
-                temp_dir
+            response = await client.get(
+                f"{BUILD_WORKER_URL}/health"
             )
 
-            files.append(filename)
+        if response.status_code != 200:
+            return {
+                "configured": True,
+                "status": "worker_error"
+            }
 
-        manifest={
-            "name":project["name"],
-            "project_id":project["id"],
-            "generated_at":
-                datetime.utcnow().isoformat()+"Z",
-            "files":files
+        return {
+            "configured": True,
+            "status": "online",
+            "worker": response.json()
         }
 
-        (temp_dir/"msweb.json").write_text(
-            json.dumps(
-                manifest,
-                indent=2,
-                ensure_ascii=False
-            ),
-            encoding="utf-8"
-        )
+    except Exception as exc:
 
-        zip_path=EXPORTS_DIR / (
-            safe_name(project["name"])
-            +"-"
-            +export_id[:8]
-            +".zip"
-        )
-
-        with zipfile.ZipFile(
-            zip_path,
-            "w",
-            zipfile.ZIP_DEFLATED
-        ) as archive:
-
-            for file in temp_dir.rglob("*"):
-
-                if file.is_file():
-
-                    archive.write(
-                        file,
-                        file.relative_to(temp_dir)
-                    )
-
-        shutil.rmtree(
-            temp_dir,
-            ignore_errors=True
-        )
-
-        return FileResponse(
-            path=zip_path,
-            filename=zip_path.name,
-            media_type="application/zip"
-        )
-
-    except Exception as error:
-
-        shutil.rmtree(
-            temp_dir,
-            ignore_errors=True
-        )
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Export failed: {error}"
-        )
-
-
-# ============================================================
-# IMPORT PROJECT JSON
-# ============================================================
-
-@app.post("/api/projects/import")
-def import_project(payload: Dict[str, Any]):
-
-    if not isinstance(payload, dict):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid project data"
-        )
-
-    name = str(
-        payload.get(
-            "name",
-            "Imported Project"
-        )
-    ).strip()
-
-    pages = payload.get("pages")
-
-    if not isinstance(pages, dict) or not pages:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Project must contain pages"
-        )
-
-    project_id=str(uuid.uuid4())
-
-    now=datetime.utcnow().isoformat()+"Z"
-
-    normalized_pages={}
-
-    for page_id,page in pages.items():
-
-        validate_page_id(str(page_id))
-
-        if not isinstance(page,dict):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid page: {page_id}"
-            )
-
-        normalized_pages[str(page_id)]={
-            "name":str(
-                page.get(
-                    "name",
-                    page_id
-                )
-            ),
-            "html":str(
-                page.get(
-                    "html",
-                    ""
-                )
-            ),
-            "css":str(
-                page.get(
-                    "css",
-                    ""
-                )
-            ),
-            "js":str(
-                page.get(
-                    "js",
-                    ""
-                )
-            )
+        return {
+            "configured": True,
+            "status": "offline",
+            "error": str(exc)
         }
 
-    current=payload.get(
-        "current",
-        next(iter(normalized_pages))
-    )
 
-    if current not in normalized_pages:
-        current=next(iter(normalized_pages))
-
-    project={
-        "id":project_id,
-        "name":name[:100] or "Imported Project",
-        "pages":normalized_pages,
-        "current":current,
-        "created_at":now,
-        "updated_at":now
-    }
-
-    save_project(project)
-
-    return {
-        "success":True,
-        "project":project
-    }
-
-
-# ============================================================
-# GLOBAL ERROR HANDLER
-# ============================================================
-
-@app.exception_handler(Exception)
-async def global_exception_handler(request, exc):
-
-    return JSONResponse(
-        status_code=500,
-        content={
-            "success":False,
-            "error":"Internal server error"
-        }
-    )
-
-
-# ============================================================
-# LOCAL DEVELOPMENT
-# ============================================================
+# =========================================================
+# START SERVER
+# =========================================================
 
 if __name__ == "__main__":
 
     import uvicorn
 
+    port = int(
+        os.getenv(
+            "PORT",
+            "10000"
+        )
+    )
+
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=8000,
-        reload=True
-)
+        port=port
+    )
